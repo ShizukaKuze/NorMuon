@@ -35,9 +35,13 @@ def zeropower_via_newtonschulz5(G, steps=5):
 def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
-    if update.ndim == 4: # for the case of conv filters
-        update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz5(update).float()
+    original_shape = None
+    if update.ndim == 4:  # for the case of conv filters
+        original_shape = update.shape
+        update = update.reshape(update.size(0), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps).float()
+    if original_shape is not None:
+        update = update.reshape(original_shape)
     ################ NorMuon added ###################
     vnorm = update.norm(dim=(-2,-1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
@@ -73,7 +77,8 @@ class NorMuon(torch.optim.Optimizer):
             for base_i in range(len(params))[::dist.get_world_size()]:
                 if base_i + dist.get_rank() < len(params):
                     p = params[base_i + dist.get_rank()]
-                    if p.grad is None:
+                    had_grad = p.grad is not None
+                    if not had_grad:
                         # continue
                         p.grad = torch.zeros_like(p)  # Force synchronization
                     state = self.state[p]
@@ -81,7 +86,8 @@ class NorMuon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
@@ -106,7 +112,8 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
 
         for group in self.param_groups:
             for p in group["params"]:
-                if p.grad is None:
+                had_grad = p.grad is not None
+                if not had_grad:
                     # continue
                     p.grad = torch.zeros_like(p)  # Force synchronization
                 state = self.state[p]
@@ -114,7 +121,151 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p)
                     state["second_momentum_buffer"] = torch.zeros_like(p[...,0:1])
                 update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
-                p.mul_(1 - group["lr"] * group["weight_decay"])
+                if group["weight_decay"] and had_grad:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+        return loss
+
+
+def adam_update(grad, buf1, buf2, step, betas, eps):
+    buf1.lerp_(grad, 1 - betas[0])
+    buf2.lerp_(grad.square(), 1 - betas[1])
+    buf1c = buf1 / (1 - betas[0]**step)
+    buf2c = buf2 / (1 - betas[1]**step)
+    return buf1c / (buf2c.sqrt() + eps)
+
+
+class NorMuonWithAuxAdam(torch.optim.Optimizer):
+    """
+    Distributed NorMuon variant paired with an auxiliary Adam optimizer for parameters that are not
+    compatible with NorMuon. Groups intended for NorMuon should set `use_muon=True`.
+    """
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["beta2"] = group.get("beta2", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+            else:
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
+                for base_i in range(len(params))[::dist.get_world_size()]:
+                    if base_i + dist.get_rank() < len(params):
+                        p = params[base_i + dist.get_rank()]
+                        had_grad = p.grad is not None
+                        if not had_grad:
+                            p.grad = torch.zeros_like(p)
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                            state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                        update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
+                                                beta=group["momentum"], beta2=group["beta2"])
+                        if group["weight_decay"] and had_grad:
+                            p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
+            else:
+                for p in group["params"]:
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
+                                         state["step"], group["betas"], group["eps"])
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
+
+
+class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
+    """
+    Non-distributed counterpart to NorMuonWithAuxAdam.
+    """
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["beta2"] = group.get("beta2", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+            else:
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                for p in group["params"]:
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                        state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                    update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
+                                            beta=group["momentum"], beta2=group["beta2"])
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+            else:
+                for p in group["params"]:
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
+                                         state["step"], group["betas"], group["eps"])
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
 
         return loss
