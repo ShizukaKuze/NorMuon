@@ -40,6 +40,8 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update = update.to(grad.dtype)
+
     if original_shape is not None:
         update = update.reshape(original_shape)
     ################ NorMuon added ###################
