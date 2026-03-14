@@ -1,11 +1,6 @@
 # NorMuon
-Official Implementation for [NorMuon paper](https://arxiv.org/abs/2510.05491)
 
-## Code
-We release our implementation in normuon.py, modified from the original [Muon](https://github.com/KellerJordan/Muon/tree/master) code. For a distributed version, we've made a PR to the [Dion](https://github.com/microsoft/dion/pull/19) codebase.
-We also make a PR to the modded-nanogpt [here](https://github.com/KellerJordan/modded-nanogpt/pull/141).
-
-NorMuon is also used in the recent [nanochat](https://github.com/karpathy/nanochat) project!
+This is an unofficial optimized implementation for the [NorMuon paper](https://arxiv.org/abs/2510.05491) Many of these optimizations were adapted from the Modded NanoGPT repository. This is a standalone version of the NorMuon optimizer, which features several improvements over the urgent code base, including 
 
 ## Installation
 
